@@ -36,6 +36,10 @@ const s3 = new AWS.S3({
   region: process.env.AWS_REGION,
 });
 
+app.get("/test", (req, res) => {
+  res.send("Hello World!");
+})
+
 app.post("/api/postToBluesky", async (req, res) => {
   const status = req.body.status;
   const url = req.body.url;
@@ -67,8 +71,6 @@ app.post("/api/postToBluesky", async (req, res) => {
         },
       },
     };
-
-    console.log(JSON.stringify(_post, null, 2));
 
     await agent.login({
       identifier: process.env.BLUESKY_IDENTIFIER,
