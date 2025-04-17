@@ -1,7 +1,11 @@
 const express = require("express");
 const AWS = require("aws-sdk");
 const AtpAgent = require("@atproto/api").AtpAgent;
+const multer = require("multer");
+const fs = require("fs");
 const RichText = require("@atproto/api").RichText;
+const path = require("path");
+const sharp = require("sharp");
 const cors = require("cors");
 require("dotenv").config();
 
@@ -24,8 +28,21 @@ const corsOptions = {
   },
 };
 
+// Authorization middleware function
+function checkAuthorization(req, res, next) {
+  const authHeader = req.headers.authorization;
+  const expectedToken = `Bearer ${process.env.ADMIN_PASSWORD}`;
+
+  if (authHeader !== expectedToken) {
+    return res.status(403).send("Forbidden");
+  }
+
+  next(); // Proceed to the next middleware or route handler
+}
+
 const app = express();
 app.use(cors(corsOptions));
+app.use(checkAuthorization);
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb" }));
 
@@ -36,9 +53,248 @@ const s3 = new AWS.S3({
   region: process.env.AWS_REGION,
 });
 
-app.get("/test", (req, res) => {
-  res.send("Hello World!");
-})
+const formatDate = () => {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(
+    2,
+    "0",
+  )}-${String(now.getDate()).padStart(2, "0")}-${String(
+    now.getHours(),
+  ).padStart(2, "0")}-${String(now.getMinutes()).padStart(2, "0")}-${String(
+    now.getSeconds(),
+  ).padStart(2, "0")}`;
+};
+
+// Set up multer for file uploads
+const storage = multer.diskStorage({
+  destination: function(req, file, cb) {
+    cb(null, "uploads/");
+  },
+  filename: function(req, file, cb) {
+    const formattedDate = formatDate();
+    cb(null, formattedDate + path.extname(file.originalname)); // Append the file extension
+  },
+});
+const upload = multer({ storage: storage });
+
+if (!fs.existsSync("uploads")) {
+  fs.mkdirSync("uploads");
+}
+
+const smallSize = 800;
+const largeSize = 2000;
+
+const resizeImage = (inputPath, outputDir, callback) => {
+  const fileName = path.basename(inputPath, path.extname(inputPath));
+
+  // Define output paths
+  const smallPath = path.join(outputDir, `${fileName}-${smallSize}.jpg`);
+  const largePath = path.join(outputDir, `${fileName}-${largeSize}.jpg`);
+
+  // Resize to small (800px)
+  sharp(inputPath)
+    .resize(smallSize, smallSize, {
+      fit: "inside",
+      withoutEnlargement: true,
+    })
+    .toFile(smallPath, (err) => {
+      if (err) {
+        return callback(err);
+      }
+
+      // Resize to large (2000px)
+      sharp(inputPath)
+        .resize(largeSize, largeSize, {
+          fit: "inside",
+          withoutEnlargement: true,
+        })
+        .toFile(largePath, (err) => {
+          if (err) {
+            return callback(err);
+          }
+
+          callback(null, {
+            small: smallPath,
+            large: largePath,
+          });
+        });
+    });
+};
+
+const uploadToS3 = (filePath, key, contentType, callback) => {
+  const fileContent = fs.readFileSync(filePath);
+
+  const params = {
+    Bucket: process.env.S3_BUCKET_NAME,
+    Key: key,
+    Body: fileContent,
+    ContentType: contentType,
+  };
+
+  s3.upload(params, (err, data) => {
+    if (err) {
+      return callback(err);
+    }
+    callback(null, data.Location);
+  });
+};
+
+app.get("/", (req, res) => {
+  res.send("Hello, this is the upload server!");
+});
+
+function uploadToS3Promise(filePath, key, contentType) {
+  return new Promise((resolve, reject) => {
+    uploadToS3(filePath, key, contentType, (err, location) => {
+      if (err) return reject(err);
+      resolve(location);
+    });
+  });
+}
+
+app.post("/api/upload", upload.single("file"), async (req, res) => {
+  const file = req.file;
+  if (!file) {
+    return res.status(400).send("No file uploaded.");
+  }
+
+  const mime = file.mimetype;
+  const ext = path.extname(file.originalname).toLowerCase();
+  const fileName = path.basename(file.path, ext);
+
+  try {
+    if (mime.startsWith("image/") && ext !== ".gif") {
+      // Handle image (non-GIF)
+      const outputDir = "uploads/";
+      resizeImage(file.path, outputDir, async (err, resizedImages) => {
+        if (err) {
+          console.error("Error resizing image:", err);
+          return res.status(500).send("Error resizing image.");
+        }
+
+        const { small, large } = resizedImages;
+
+        try {
+          const largeLocation = await uploadToS3Promise(
+            large,
+            `${fileName}-${largeSize}.jpg`,
+            "image/jpeg",
+          );
+
+          const smallLocation = await uploadToS3Promise(
+            small,
+            `${fileName}-${smallSize}.jpg`,
+            "image/jpeg",
+          );
+
+          fs.unlinkSync(file.path);
+          fs.unlinkSync(small);
+          fs.unlinkSync(large);
+
+          return res.send({
+            message: "Images uploaded successfully",
+            smallImageUrl: smallLocation,
+            largeImageUrl: largeLocation,
+          });
+        } catch (uploadErr) {
+          console.error("Image upload error:", uploadErr);
+          return res.status(500).send("Error uploading images.");
+        }
+      });
+    } else if (ext === ".gif") {
+      // Handle GIF
+      const gifKey = `${fileName}.gif`;
+      const jpgKey = `${fileName}-preview.jpg`;
+
+      const firstFrameBuffer = await sharp(file.path, { pages: 1 })
+        .jpeg()
+        .toBuffer();
+      const jpgPath = path.join(path.dirname(file.path), jpgKey);
+      fs.writeFileSync(jpgPath, firstFrameBuffer);
+
+      const gifLocation = await uploadToS3Promise(
+        file.path,
+        gifKey,
+        "image/gif",
+      );
+      const jpgLocation = await uploadToS3Promise(
+        jpgPath,
+        jpgKey,
+        "image/jpeg",
+      );
+
+      fs.unlinkSync(file.path);
+      fs.unlinkSync(jpgPath);
+
+      return res.send({
+        message: "GIF and preview uploaded successfully",
+        gifUrl: gifLocation,
+        jpgUrl: jpgLocation,
+      });
+    } else if (mime.startsWith("video/")) {
+      // Handle video
+      const key = `${fileName}.mp4`;
+      const location = await uploadToS3Promise(file.path, key, "video/mp4");
+      fs.unlinkSync(file.path);
+
+      return res.send({
+        message: "Video uploaded successfully",
+        videoUrl: location,
+      });
+    } else if (mime.startsWith("audio/")) {
+      // Handle audio
+      const key = `${fileName}.mp3`;
+      const location = await uploadToS3Promise(file.path, key, "audio/mpeg");
+      fs.unlinkSync(file.path);
+
+      return res.send({
+        message: "Audio uploaded successfully",
+        audioUrl: location,
+      });
+    } else {
+      fs.unlinkSync(file.path);
+      return res.status(400).send("Unsupported file type.");
+    }
+  } catch (err) {
+    console.error("Unexpected error:", err);
+    fs.unlinkSync(file.path);
+    return res.status(500).send("Unexpected server error.");
+  }
+});
+
+app.get("/api/list-objects", async (req, res) => {
+  const params = {
+    Bucket: process.env.S3_BUCKET_NAME,
+  };
+
+  try {
+    const data = await s3.listObjectsV2(params).promise();
+    const sortedData = data.Contents.sort(
+      (a, b) => new Date(b.LastModified) - new Date(a.LastModified),
+    );
+    res.json(sortedData);
+  } catch (err) {
+    console.error("Error listing objects:", err);
+    res.status(500).send("Error listing objects.");
+  }
+});
+
+app.post("/api/postToMastodon", async (req, res) => {
+  const post = req.body.post;
+  try {
+    const client = createRestAPIClient({
+      url: "https://mastodon.social",
+      accessToken: process.env.MASTODON_ACCESS_TOKEN,
+    });
+
+    await client.v1.statuses.create(post);
+
+    res.json({ success: "posted" });
+  } catch (error) {
+    console.log(error);
+    res.status(500).send("Error posting to mastodon.");
+  }
+});
 
 app.post("/api/postToBluesky", async (req, res) => {
   const status = req.body.status;
