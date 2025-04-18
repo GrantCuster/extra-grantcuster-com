@@ -313,6 +313,8 @@ app.post("/api/postToBluesky", async (req, res) => {
     });
     await rt.detectFacets(agent);
 
+    console.log(image)
+
     const _post = {
       text: rt.text,
       facets: rt.facets,
@@ -328,6 +330,7 @@ app.post("/api/postToBluesky", async (req, res) => {
       },
     };
 
+
     await agent.login({
       identifier: process.env.BLUESKY_IDENTIFIER,
       password: process.env.BLUESKY_PASSWORD,
@@ -338,6 +341,10 @@ app.post("/api/postToBluesky", async (req, res) => {
         "https://grant-uploader.s3.amazonaws.com/",
         "",
       ),
+      _post.embed.external.thumb.replace(
+        "https://grant-uploader.s3.us-east-2.amazonaws.com/",
+        "",
+      )
     );
 
     _post.embed.external.thumb = data.blob;
