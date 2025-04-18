@@ -7,6 +7,7 @@ const RichText = require("@atproto/api").RichText;
 const path = require("path");
 const sharp = require("sharp");
 const cors = require("cors");
+const mastoCreate = require("masto").createRestAPIClient;
 require("dotenv").config();
 
 const agent = new AtpAgent({
@@ -280,9 +281,18 @@ app.get("/api/list-objects", async (req, res) => {
 });
 
 app.post("/api/postToMastodon", async (req, res) => {
-  const post = req.body.post;
+  const status = req.body.status;
+  const post = {
+    status,
+    visibility: "public",
+  }
+
+  if (req.headers.authorization !== "Bearer " + process.env.ADMIN_PASSWORD) {
+    return res.status(403).send("Forbidden");
+  }
+
   try {
-    const client = createRestAPIClient({
+    const client = mastoCreate({
       url: "https://mastodon.social",
       accessToken: process.env.MASTODON_ACCESS_TOKEN,
     });
