@@ -340,8 +340,7 @@ app.post("/api/postToBluesky", async (req, res) => {
       _post.embed.external.thumb.replace(
         "https://grant-uploader.s3.amazonaws.com/",
         "",
-      ),
-      _post.embed.external.thumb.replace(
+      ).replace(
         "https://grant-uploader.s3.us-east-2.amazonaws.com/",
         "",
       )
