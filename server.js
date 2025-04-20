@@ -59,7 +59,8 @@ const corsOptions = {
   origin: function (origin, callback) {
     if (
       process.env.NODE_ENV !== "production" ||
-      origin === "https://garden.grantcuster.com"
+      origin === "https://feed.grantcuster.com" ||
+      origin === "https://scrawl.grantcuster.com"
     ) {
       callback(null, true);
     } else {
