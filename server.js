@@ -5,19 +5,58 @@ const multer = require("multer");
 const fs = require("fs");
 const RichText = require("@atproto/api").RichText;
 const path = require("path");
+const postgres = require("postgres");
 const sharp = require("sharp");
 const cors = require("cors");
 const mastoCreate = require("masto").createRestAPIClient;
+const slugify = require("slugify");
 require("dotenv").config();
 
 const agent = new AtpAgent({
   service: "https://bsky.social",
 });
 
+function makeSlugTitle(text) {
+  return slugify(text, {
+    lower: true, // Convert to lowercase
+    strict: true, // Remove special characters
+    replacement: "-", // Replace spaces with hyphens (default)
+  });
+}
+
+function dateToSlugTimestamp(date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  const seconds = String(date.getSeconds()).padStart(2, "0");
+
+  return `${year}-${month}-${day}-${hours}-${minutes}-${seconds}`;
+}
+
+function makeSlug(date, title) {
+  let slug= dateToSlugTimestamp(date);
+  if (title && title.length > 0) {
+    const titleSlug = makeSlugTitle(title);
+    slug += `-${titleSlug}`;
+  }
+  return slug;
+}
+
+function makeDBTimestamp(date) {
+  // Should not need to do this with the offset
+  const timezoneOffset = new Date().getTimezoneOffset() * 60 * 1000;
+  const dbTimestamp = new Date(date.getTime() - timezoneOffset).toISOString();
+  return dbTimestamp;
+}
+
+const sql = postgres(process.env.DATABASE_URL || "");
+
 console.log("process.env.NODE_ENV", process.env.NODE_ENV);
 
 const corsOptions = {
-  origin: function(origin, callback) {
+  origin: function (origin, callback) {
     if (
       process.env.NODE_ENV !== "production" ||
       origin === "https://garden.grantcuster.com"
@@ -68,10 +107,10 @@ const formatDate = () => {
 
 // Set up multer for file uploads
 const storage = multer.diskStorage({
-  destination: function(req, file, cb) {
+  destination: function (req, file, cb) {
     cb(null, "uploads/");
   },
-  filename: function(req, file, cb) {
+  filename: function (req, file, cb) {
     const formattedDate = formatDate();
     cb(null, formattedDate + path.extname(file.originalname)); // Append the file extension
   },
@@ -280,12 +319,54 @@ app.get("/api/list-objects", async (req, res) => {
   }
 });
 
+app.post("/api/postToFeed", async (req, res) => {
+  if (req.headers.authorization !== "Bearer " + process.env.ADMIN_PASSWORD) {
+    return res.status(403).send("Forbidden");
+  }
+
+  const { title, content, created_at = new Date(), tags } = req.body;
+  const slug = req.body.slug || makeSlug(created_at, title);
+
+  const dbTimestamp = makeDBTimestamp(created_at);
+
+  const idData = await sql`
+      INSERT INTO posts (title, content, slug, created_at, updated_at)
+      VALUES (${title ||  null}, ${content}, ${slug}, ${dbTimestamp}, ${dbTimestamp})
+      RETURNING id`;
+
+  const id = idData[0].id;
+
+  // Extract current tag names
+  const currentTagNames = tags;
+
+  for (const tag of currentTagNames) {
+    let tagId;
+
+    // Ensure the tag exists in the 'tags' table
+    const tagRecord = await sql`
+        INSERT INTO tags (name)
+        VALUES (${tag})
+        ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+        RETURNING id`;
+
+    tagId = tagRecord[0].id;
+
+    // Ensure the association exists in 'post_tags'
+    await sql`
+        INSERT INTO post_tags (post_id, tag_id)
+        VALUES (${id}, ${tagId})
+        ON CONFLICT (post_id, tag_id) DO NOTHING`;
+  }
+
+  res.json({ success: "posted" });
+});
+
 app.post("/api/postToMastodon", async (req, res) => {
   const status = req.body.status;
   const post = {
     status,
     visibility: "public",
-  }
+  };
 
   if (req.headers.authorization !== "Bearer " + process.env.ADMIN_PASSWORD) {
     return res.status(403).send("Forbidden");
@@ -323,7 +404,7 @@ app.post("/api/postToBluesky", async (req, res) => {
     });
     await rt.detectFacets(agent);
 
-    console.log(image)
+    console.log(image);
 
     const _post = {
       text: rt.text,
@@ -340,20 +421,15 @@ app.post("/api/postToBluesky", async (req, res) => {
       },
     };
 
-
     await agent.login({
       identifier: process.env.BLUESKY_IDENTIFIER,
       password: process.env.BLUESKY_PASSWORD,
     });
     const data = await uploadS3FileToAgent(
       agent,
-      _post.embed.external.thumb.replace(
-        "https://grant-uploader.s3.amazonaws.com/",
-        "",
-      ).replace(
-        "https://grant-uploader.s3.us-east-2.amazonaws.com/",
-        "",
-      )
+      _post.embed.external.thumb
+        .replace("https://grant-uploader.s3.amazonaws.com/", "")
+        .replace("https://grant-uploader.s3.us-east-2.amazonaws.com/", ""),
     );
 
     _post.embed.external.thumb = data.blob;
