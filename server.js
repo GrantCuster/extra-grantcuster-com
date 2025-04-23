@@ -10,6 +10,7 @@ const sharp = require("sharp");
 const cors = require("cors");
 const mastoCreate = require("masto").createRestAPIClient;
 const slugify = require("slugify");
+const ffmpeg = require("fluent-ffmpeg");
 require("dotenv").config();
 
 const agent = new AtpAgent({
@@ -36,7 +37,7 @@ function dateToSlugTimestamp(date) {
 }
 
 function makeSlug(date, title) {
-  let slug= dateToSlugTimestamp(date);
+  let slug = dateToSlugTimestamp(date);
   if (title && title.length > 0) {
     const titleSlug = makeSlugTitle(title);
     slug += `-${titleSlug}`;
@@ -56,7 +57,7 @@ const sql = postgres(process.env.DATABASE_URL || "");
 console.log("process.env.NODE_ENV", process.env.NODE_ENV);
 
 const corsOptions = {
-  origin: function (origin, callback) {
+  origin: function(origin, callback) {
     if (
       process.env.NODE_ENV !== "production" ||
       origin === "https://feed.grantcuster.com" ||
@@ -108,10 +109,10 @@ const formatDate = () => {
 
 // Set up multer for file uploads
 const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
+  destination: function(req, file, cb) {
     cb(null, "uploads/");
   },
-  filename: function (req, file, cb) {
+  filename: function(req, file, cb) {
     const formattedDate = formatDate();
     cb(null, formattedDate + path.extname(file.originalname)); // Append the file extension
   },
@@ -332,7 +333,7 @@ app.post("/api/postToFeed", async (req, res) => {
 
   const idData = await sql`
       INSERT INTO posts (title, content, slug, created_at, updated_at)
-      VALUES (${title ||  null}, ${content}, ${slug}, ${dbTimestamp}, ${dbTimestamp})
+      VALUES (${title || null}, ${content}, ${slug}, ${dbTimestamp}, ${dbTimestamp})
       RETURNING id`;
 
   const id = idData[0].id;
@@ -388,6 +389,99 @@ app.post("/api/postToMastodon", async (req, res) => {
   }
 });
 
+app.post("/api/postImageOrGifToMastodon", async (req, res) => {
+  const status = req.body.status;
+  const imageUrl = req.body.imageUrl;
+
+  if (req.headers.authorization !== "Bearer " + process.env.ADMIN_PASSWORD) {
+    return res.status(403).send("Forbidden");
+  }
+
+  try {
+    const client = mastoCreate({
+      url: "https://mastodon.social",
+      accessToken: process.env.MASTODON_ACCESS_TOKEN,
+    });
+
+    const remoteFile = await fetch(imageUrl);
+    const media = await client.v2.media.create({
+      file: await remoteFile.blob(),
+      description: "",
+    });
+
+    const post = {
+      status,
+      visibility: "public",
+      mediaIds: [media.id],
+    };
+
+    await client.v1.statuses.create(post);
+
+    res.json({ success: "posted" });
+  } catch (error) {
+    console.log(error);
+    res.status(500).send("Error posting to mastodon.");
+  }
+});
+
+app.post("/api/postImageToBluesky", async (req, res) => {
+  const status = req.body.status;
+  const imageUrl = req.body.imageUrl;
+  const width = req.body.width;
+  const height = req.body.height;
+
+  // Fetch the remote image
+  const response = await fetch(imageUrl);
+  const arrayBuffer = await response.arrayBuffer();
+  const uint8Array = new Uint8Array(arrayBuffer);
+
+  // Retrieve the content type (MIME type)
+  const contentType = response.headers.get("content-type");
+
+  await agent.login({
+    identifier: process.env.BLUESKY_IDENTIFIER,
+    password: process.env.BLUESKY_PASSWORD,
+  });
+
+  // Upload the blob with the retrieved content type
+  const { data } = await agent.uploadBlob(uint8Array, {
+    encoding: contentType, // Use the MIME type from the response
+  });
+
+  try {
+    const rt = new RichText({
+      text: status,
+    });
+    await rt.detectFacets(agent);
+
+    const _post = {
+      text: rt.text,
+      facets: rt.facets,
+      createdAt: new Date().toISOString(),
+      embed: {
+        $type: "app.bsky.embed.images",
+        images: [
+          {
+            alt: "Description of your image", // Add an appropriate alt text
+            image: data.blob,
+            aspectRatio: {
+              width: width, // Use width from request body
+              height: height, // Use height from request body
+            },
+          },
+        ],
+      },
+    };
+
+    await agent.post(_post);
+
+    res.json({ success: "posted" });
+  } catch (error) {
+    console.log(error);
+    res.status(500).send("Error uploading file to agent.");
+  }
+});
+
 app.post("/api/postToBluesky", async (req, res) => {
   const status = req.body.status;
   const url = req.body.url;
@@ -404,8 +498,6 @@ app.post("/api/postToBluesky", async (req, res) => {
       text: status,
     });
     await rt.detectFacets(agent);
-
-    console.log(image);
 
     const _post = {
       text: rt.text,
@@ -442,6 +534,110 @@ app.post("/api/postToBluesky", async (req, res) => {
     console.log(error);
     res.status(500).send("Error uploading file to agent.");
   }
+});
+
+app.post("/api/postGifToBluesky", async (req, res) => {
+  console.log("posting gif to bluesky");
+  const status = req.body.status;
+  const imageUrl = req.body.imageUrl;
+
+  // Step 1: Download the GIF
+  const response = await fetch(imageUrl);
+  const arrayBuffer = await response.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+  const inputFilePath = "./input.gif";
+  fs.writeFileSync(inputFilePath, buffer);
+
+  // Step 2: Process the GIF with ffmpeg
+  const outputFilePath = "./output.mp4";
+  await new Promise((resolve, reject) => {
+    ffmpeg(inputFilePath)
+      .outputOptions("-movflags", "faststart", "-pix_fmt", "yuv420p")
+      .videoFilters("scale=trunc(iw/2)*2:trunc(ih/2)*2")
+      .on("end", resolve)
+      .on("error", reject)
+      .save(outputFilePath);
+  });
+
+  const video = fs.readFileSync(outputFilePath);
+
+  // video upload based on https://gist.github.com/mozzius/5cbbd15e12cdc0cb1d0d992b7c3b1d0f?permalink_comment_id=5506517#gistcomment-5506517
+
+  await agent.login({
+    identifier: process.env.BLUESKY_IDENTIFIER,
+    password: process.env.BLUESKY_PASSWORD,
+  });
+
+  // Upload the blob with the retrieved content type
+  const uploadUrl = new URL(
+    "https://video.bsky.app/xrpc/app.bsky.video.uploadVideo",
+  );
+  uploadUrl.searchParams.append("did", agent.session.did);
+  uploadUrl.searchParams.append("name", imageUrl.split("/").pop());
+
+  const { data: serviceAuth } = await agent.com.atproto.server.getServiceAuth({
+    aud: `did:web:${agent.dispatchUrl.host}`,
+    lxm: "com.atproto.repo.uploadBlob",
+    exp: Date.now() / 1000 + 60 * 30, // 30 minutes
+  });
+
+  const uploadResponse = await fetch(uploadUrl, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${serviceAuth.token}`,
+      "Content-Type": "video/mp4",
+      "Content-Length": video.byteLength.toString(),
+    },
+    body: video,
+  });
+
+  const jobStatus = await uploadResponse.json();
+  console.log("JobId:", jobStatus.jobId);
+  let blob = jobStatus.blob;
+  const videoAgent = new AtpAgent({ service: "https://video.bsky.app" });
+
+  while (!blob) {
+    const { data: status } = await videoAgent.app.bsky.video.getJobStatus({
+      jobId: jobStatus.jobId,
+    });
+    console.log(
+      "Status:",
+      status.jobStatus.state,
+      status.jobStatus.progress || "",
+    );
+    if (status.jobStatus.blob) {
+      blob = status.jobStatus.blob;
+    }
+    // wait a second
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+
+  console.log("video uploaded");
+  console.log("posting...");
+
+  const rt = new RichText({
+    text: status,
+  });
+  await rt.detectFacets(agent);
+
+  const _post = {
+    text: rt.text,
+    facets: rt.facets,
+    createdAt: new Date().toISOString(),
+    embed: {
+      $type: "app.bsky.embed.video",
+      video: blob,
+    },
+  };
+  await agent.post(_post);
+
+  console.log("posted");
+
+  // Cleanup temporary files
+  fs.unlinkSync(inputFilePath);
+  fs.unlinkSync(outputFilePath);
+
+  res.json({ success: "posted" });
 });
 
 async function uploadS3FileToAgent(agent, s3Key) {
