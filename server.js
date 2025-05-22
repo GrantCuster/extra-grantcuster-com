@@ -57,7 +57,7 @@ const sql = postgres(process.env.DATABASE_URL || "");
 console.log("process.env.NODE_ENV", process.env.NODE_ENV);
 
 const corsOptions = {
-  origin: function(origin, callback) {
+  origin: function (origin, callback) {
     if (
       process.env.NODE_ENV !== "production" ||
       origin === "https://feed.grantcuster.com" ||
@@ -109,10 +109,10 @@ const formatDate = () => {
 
 // Set up multer for file uploads
 const storage = multer.diskStorage({
-  destination: function(req, file, cb) {
+  destination: function (req, file, cb) {
     cb(null, "uploads/");
   },
-  filename: function(req, file, cb) {
+  filename: function (req, file, cb) {
     const formattedDate = formatDate();
     cb(null, formattedDate + path.extname(file.originalname)); // Append the file extension
   },
@@ -194,6 +194,14 @@ function uploadToS3Promise(filePath, key, contentType) {
   });
 }
 
+function addToUploadsTable(filePath, key, contentType) {
+  const created_at = new Date();
+  return sql`
+    INSERT INTO uploads (file_path, s3_key, content_type, created_at)
+    VALUES (${filePath}, ${key}, ${contentType}, ${created_at})
+    RETURNING id`;
+}
+
 app.post("/api/upload", upload.single("file"), async (req, res) => {
   const file = req.file;
   if (!file) {
@@ -233,6 +241,17 @@ app.post("/api/upload", upload.single("file"), async (req, res) => {
           fs.unlinkSync(small);
           fs.unlinkSync(large);
 
+          await addToUploadsTable(
+            file.path,
+            `${fileName}-${largeSize}.jpg`,
+            "image/jpeg",
+          );
+          await addToUploadsTable(
+            file.path,
+            `${fileName}-${smallSize}.jpg`,
+            "image/jpeg",
+          );
+
           return res.send({
             message: "Images uploaded successfully",
             smallImageUrl: smallLocation,
@@ -268,6 +287,8 @@ app.post("/api/upload", upload.single("file"), async (req, res) => {
       fs.unlinkSync(file.path);
       fs.unlinkSync(jpgPath);
 
+      await addToUploadsTable(file.path, gifKey, "image/gif");
+
       return res.send({
         message: "GIF and preview uploaded successfully",
         gifUrl: gifLocation,
@@ -279,6 +300,8 @@ app.post("/api/upload", upload.single("file"), async (req, res) => {
       const location = await uploadToS3Promise(file.path, key, "video/mp4");
       fs.unlinkSync(file.path);
 
+      await addToUploadsTable(file.path, key, "video/mp4");
+
       return res.send({
         message: "Video uploaded successfully",
         videoUrl: location,
@@ -288,6 +311,8 @@ app.post("/api/upload", upload.single("file"), async (req, res) => {
       const key = `${fileName}.mp3`;
       const location = await uploadToS3Promise(file.path, key, "audio/mpeg");
       fs.unlinkSync(file.path);
+
+      await addToUploadsTable(file.path, key, "audio/mpeg");
 
       return res.send({
         message: "Audio uploaded successfully",
@@ -305,8 +330,17 @@ app.post("/api/upload", upload.single("file"), async (req, res) => {
 });
 
 app.get("/api/list-objects", async (req, res) => {
+  if (req.headers.authorization !== "Bearer " + process.env.ADMIN_PASSWORD) {
+    return res.status(403).send("Forbidden");
+  }
+
+  const maxKeys = 20; // Limit to 20 objects
+  const continuationToken = req.query.continuationToken || null; // Optional token for pagination
+
   const params = {
     Bucket: process.env.S3_BUCKET_NAME,
+    MaxKeys: maxKeys,
+    ContinuationToken: continuationToken,
   };
 
   try {
@@ -314,7 +348,11 @@ app.get("/api/list-objects", async (req, res) => {
     const sortedData = data.Contents.sort(
       (a, b) => new Date(b.LastModified) - new Date(a.LastModified),
     );
-    res.json(sortedData);
+
+    res.json({
+      Contents: sortedData,
+      NextContinuationToken: data.NextContinuationToken, // Include next token for pagination
+    });
   } catch (err) {
     console.error("Error listing objects:", err);
     res.status(500).send("Error listing objects.");
