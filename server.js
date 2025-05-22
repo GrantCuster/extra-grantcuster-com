@@ -194,11 +194,11 @@ function uploadToS3Promise(filePath, key, contentType) {
   });
 }
 
-function addToUploadsTable(filePath, key, contentType) {
+function addToUploadsTable(key, contentType) {
   const created_at = new Date();
   return sql`
-    INSERT INTO uploads (file_path, s3_key, content_type, created_at)
-    VALUES (${filePath}, ${key}, ${contentType}, ${created_at})
+    INSERT INTO uploads (s3_key, file_type, created_at)
+    VALUES (${key}, ${contentType}, ${created_at})
     RETURNING id`;
 }
 
@@ -242,12 +242,10 @@ app.post("/api/upload", upload.single("file"), async (req, res) => {
           fs.unlinkSync(large);
 
           await addToUploadsTable(
-            file.path,
             `${fileName}-${largeSize}.jpg`,
             "image/jpeg",
           );
           await addToUploadsTable(
-            file.path,
             `${fileName}-${smallSize}.jpg`,
             "image/jpeg",
           );
@@ -287,7 +285,7 @@ app.post("/api/upload", upload.single("file"), async (req, res) => {
       fs.unlinkSync(file.path);
       fs.unlinkSync(jpgPath);
 
-      await addToUploadsTable(file.path, gifKey, "image/gif");
+      await addToUploadsTable(gifKey, "image/gif");
 
       return res.send({
         message: "GIF and preview uploaded successfully",
@@ -300,7 +298,7 @@ app.post("/api/upload", upload.single("file"), async (req, res) => {
       const location = await uploadToS3Promise(file.path, key, "video/mp4");
       fs.unlinkSync(file.path);
 
-      await addToUploadsTable(file.path, key, "video/mp4");
+      await addToUploadsTable(key, "video/mp4");
 
       return res.send({
         message: "Video uploaded successfully",
@@ -312,7 +310,7 @@ app.post("/api/upload", upload.single("file"), async (req, res) => {
       const location = await uploadToS3Promise(file.path, key, "audio/mpeg");
       fs.unlinkSync(file.path);
 
-      await addToUploadsTable(file.path, key, "audio/mpeg");
+      await addToUploadsTable(key, "audio/mpeg");
 
       return res.send({
         message: "Audio uploaded successfully",
